@@ -8,7 +8,7 @@ import copernicusmarine
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="PescaPro Marine Worker", version="0.3.0")
+app = FastAPI(title="PescaPro Marine Worker", version="0.4.0")
 STARTED_AT = time.time()
 
 WAVE_DATASET = "cmems_mod_glo_wav_anfc_0.083deg_PT3H-i"
@@ -22,6 +22,8 @@ CACHE = {}
 CACHE_TTL_SECONDS = 15 * 60
 CACHE_MAX_ENTRIES = 64
 ZONE_STEP = 0.05
+ADAPTIVE_WINDOWS = (0.03, 0.06, 0.10)
+PHYSICS_SURFACE_DEPTH_M = 0.494
 
 class MarineRequest(BaseModel):
     latitude: float = Field(ge=-90, le=90)
@@ -96,34 +98,41 @@ def _nearest_valid_series(ds, var_names, lat, lon, surface=False):
 
     lats = np.asarray(work[latname].values, dtype=float).reshape(-1)
     lons = np.asarray(work[lonname].values, dtype=float).reshape(-1)
-    candidates = []
 
+    # Check cells in distance order and stop at the first cell that is valid
+    # for every requested variable. This avoids scanning the whole grid.
+    candidates = []
     for yi, la in enumerate(lats):
         for xi, lo in enumerate(lons):
-            valid = True
-            for vn in var_names:
-                if vn not in work:
-                    raise RuntimeError(f"Missing variable {vn}")
-                da = work[vn]
-                idx = {}
-                if latname in da.dims:
-                    idx[latname] = yi
-                if lonname in da.dims:
-                    idx[lonname] = xi
-                vals = np.asarray(da.isel(idx).values).reshape(-1)
-                if not any(_finite(x) is not None for x in vals):
-                    valid = False
-                    break
-            if valid:
-                dx = (float(lo) - lon) * math.cos(math.radians(lat))
-                dy = float(la) - lat
-                candidates.append((dx * dx + dy * dy, yi, xi, float(la), float(lo)))
+            dx = (float(lo) - lon) * math.cos(math.radians(lat))
+            dy = float(la) - lat
+            candidates.append((dx * dx + dy * dy, yi, xi, float(la), float(lo)))
+    candidates.sort(key=lambda x: x[0])
 
-    if not candidates:
+    chosen = None
+    for _, yi, xi, sla, slo in candidates:
+        valid = True
+        for vn in var_names:
+            if vn not in work:
+                raise RuntimeError(f"Missing variable {vn}")
+            da = work[vn]
+            idx = {}
+            if latname in da.dims:
+                idx[latname] = yi
+            if lonname in da.dims:
+                idx[lonname] = xi
+            vals = np.asarray(da.isel(idx).values).reshape(-1)
+            if not np.any(np.isfinite(vals.astype(float, copy=False))):
+                valid = False
+                break
+        if valid:
+            chosen = (yi, xi, sla, slo)
+            break
+
+    if chosen is None:
         raise RuntimeError("No valid marine cell found")
 
-    candidates.sort(key=lambda x: x[0])
-    _, yi, xi, sla, slo = candidates[0]
+    yi, xi, sla, slo = chosen
     result = {
         "time": [_local_iso(t, tz) for t in work[tname].values],
         "sample_latitude": sla,
@@ -156,14 +165,14 @@ def _current_direction(u, v):
         return None
     return (math.degrees(math.atan2(u, v)) + 360.0) % 360.0
 
-def _open_wave(lat, lon, start, end, username, password):
+def _open_wave(lat, lon, start, end, username, password, window):
     return copernicusmarine.open_dataset(
         dataset_id=WAVE_DATASET,
         variables=["VHM0", "VTM10", "VMDR"],
-        minimum_longitude=lon - 0.10,
-        maximum_longitude=lon + 0.10,
-        minimum_latitude=lat - 0.10,
-        maximum_latitude=lat + 0.10,
+        minimum_longitude=lon - window,
+        maximum_longitude=lon + window,
+        minimum_latitude=lat - window,
+        maximum_latitude=lat + window,
         start_datetime=start,
         end_datetime=end,
         coordinates_selection_method="outside",
@@ -171,32 +180,68 @@ def _open_wave(lat, lon, start, end, username, password):
         password=password,
     )
 
-def _open_physics(lat, lon, start, end, username, password):
+def _open_physics(lat, lon, start, end, username, password, window):
     return copernicusmarine.open_dataset(
         dataset_id=PHY_DATASET,
         variables=["thetao", "uo", "vo"],
-        minimum_longitude=lon - 0.10,
-        maximum_longitude=lon + 0.10,
-        minimum_latitude=lat - 0.10,
-        maximum_latitude=lat + 0.10,
-        minimum_depth=0,
-        maximum_depth=1,
+        minimum_longitude=lon - window,
+        maximum_longitude=lon + window,
+        minimum_latitude=lat - window,
+        maximum_latitude=lat + window,
+        # Request only the model's surface layer (~0.494 m), rather than 0-1 m.
+        minimum_depth=PHYSICS_SURFACE_DEPTH_M,
+        maximum_depth=PHYSICS_SURFACE_DEPTH_M,
         start_datetime=start,
         end_datetime=end,
         coordinates_selection_method="outside",
         username=username,
         password=password,
     )
+
+def _fetch_adaptive(req, start, end, username, password):
+    errors = []
+    for window in ADAPTIVE_WINDOWS:
+        ds = None
+        t_provider = time.monotonic()
+        try:
+            if req.kind == "waves":
+                ds = _open_wave(req.latitude, req.longitude, start, end, username, password, window)
+                variables = ["VHM0", "VTM10", "VMDR"]
+                surface = False
+            else:
+                ds = _open_physics(req.latitude, req.longitude, start, end, username, password, window)
+                variables = ["thetao", "uo", "vo"]
+                surface = True
+
+            # Materialize only this small subset so provider/network time and
+            # local processing time can be measured separately.
+            ds.load()
+            provider_seconds = time.monotonic() - t_provider
+            t_process = time.monotonic()
+            row = _nearest_valid_series(ds, variables, req.latitude, req.longitude, surface=surface)
+            processing_seconds = time.monotonic() - t_process
+            return row, window, provider_seconds, processing_seconds
+        except Exception as exc:
+            errors.append(f"{window:.2f}:{type(exc).__name__}")
+        finally:
+            if ds is not None:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+    raise RuntimeError("No valid marine data after adaptive windows: " + ",".join(errors))
 
 @app.get("/health")
 def health():
     return {
         "ok": True,
         "service": "pescapro-worker",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "uptime_seconds": int(time.time() - STARTED_AT),
         "max_rss_mb": _rss_mb(),
         "heavy_query_concurrency": 1,
+        "adaptive_windows_degrees": list(ADAPTIVE_WINDOWS),
+        "physics_surface_depth_m": PHYSICS_SURFACE_DEPTH_M,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "cache_entries": len(CACHE),
         "inflight": len(INFLIGHT),
@@ -220,8 +265,7 @@ def _compute_marine(req: MarineRequest, authorization: str | None):
 
     try:
         if req.kind == "waves":
-            ds = _open_wave(req.latitude, req.longitude, start, end, username, password)
-            row = _nearest_valid_series(ds, ["VHM0", "VTM10", "VMDR"], req.latitude, req.longitude)
+            row, query_window, provider_seconds, processing_seconds = _fetch_adaptive(req, start, end, username, password)
             hourly = {
                 "time": row["time"],
                 "wave_height": row["VHM0"],
@@ -238,8 +282,7 @@ def _compute_marine(req: MarineRequest, authorization: str | None):
             dataset = WAVE_DATASET
 
         else:
-            ds = _open_physics(req.latitude, req.longitude, start, end, username, password)
-            row = _nearest_valid_series(ds, ["thetao", "uo", "vo"], req.latitude, req.longitude, surface=True)
+            row, query_window, provider_seconds, processing_seconds = _fetch_adaptive(req, start, end, username, password)
             speeds, directions = [], []
             for u, v in zip(row["uo"], row["vo"]):
                 speeds.append(None if u is None or v is None else math.hypot(u, v) * 3.6)
@@ -263,7 +306,7 @@ def _compute_marine(req: MarineRequest, authorization: str | None):
             "ok": True,
             "mode": req.kind,
             "source": "Copernicus Marine Service",
-            "worker_version": "0.3.0",
+            "worker_version": "0.4.0",
             "dataset": dataset,
             "latitude": req.latitude,
             "longitude": req.longitude,
@@ -271,6 +314,11 @@ def _compute_marine(req: MarineRequest, authorization: str | None):
             "sample_longitude": row["sample_longitude"],
             "current": current,
             "hourly": hourly,
+            "query_window_degrees": query_window,
+            "timing": {
+                "provider_seconds": round(provider_seconds, 2),
+                "processing_seconds": round(processing_seconds, 3),
+            },
             "elapsed_seconds": round(time.monotonic() - t0, 2),
             "memory": {
                 "max_rss_before_mb": rss_before,
