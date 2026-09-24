@@ -8,7 +8,7 @@ import copernicusmarine
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="PescaPro Marine Worker", version="0.4.0")
+app = FastAPI(title="PescaPro Marine Worker", version="0.5.0")
 STARTED_AT = time.time()
 
 WAVE_DATASET = "cmems_mod_glo_wav_anfc_0.083deg_PT3H-i"
@@ -22,7 +22,8 @@ CACHE = {}
 CACHE_TTL_SECONDS = 15 * 60
 CACHE_MAX_ENTRIES = 64
 ZONE_STEP = 0.05
-ADAPTIVE_WINDOWS = (0.03, 0.06, 0.10)
+MODEL_GRID_DEGREES = 1.0 / 12.0
+ADAPTIVE_WINDOWS = (0.006, 0.03, 0.06, 0.10)
 PHYSICS_SURFACE_DEPTH_M = None
 
 class MarineRequest(BaseModel):
@@ -165,6 +166,12 @@ def _current_direction(u, v):
         return None
     return (math.degrees(math.atan2(u, v)) + 360.0) % 360.0
 
+def _model_cell_center(value):
+    # Both active Copernicus products use a ~1/12 degree horizontal grid.
+    # Snap the first attempt to the nearest model-cell center so the request
+    # can contain just that cell instead of a wider coastal box.
+    return round(float(value) / MODEL_GRID_DEGREES) * MODEL_GRID_DEGREES
+
 def _open_wave(lat, lon, start, end, username, password, window):
     return copernicusmarine.open_dataset(
         dataset_id=WAVE_DATASET,
@@ -197,16 +204,22 @@ def _open_physics(lat, lon, start, end, username, password, window):
 
 def _fetch_adaptive(req, start, end, username, password):
     errors = []
-    for window in ADAPTIVE_WINDOWS:
+    attempts = []
+    for n, window in enumerate(ADAPTIVE_WINDOWS):
         ds = None
+        # First attempt: target one calculated model cell. If that cell is
+        # land/invalid, progressively fall back to the original point and
+        # wider windows, preserving coastal reliability.
+        qlat = _model_cell_center(req.latitude) if n == 0 else req.latitude
+        qlon = _model_cell_center(req.longitude) if n == 0 else req.longitude
         t_provider = time.monotonic()
         try:
             if req.kind == "waves":
-                ds = _open_wave(req.latitude, req.longitude, start, end, username, password, window)
+                ds = _open_wave(qlat, qlon, start, end, username, password, window)
                 variables = ["VHM0", "VTM10", "VMDR"]
                 surface = False
             else:
-                ds = _open_physics(req.latitude, req.longitude, start, end, username, password, window)
+                ds = _open_physics(qlat, qlon, start, end, username, password, window)
                 variables = ["thetao", "uo", "vo"]
                 surface = True
 
@@ -217,7 +230,7 @@ def _fetch_adaptive(req, start, end, username, password):
             t_process = time.monotonic()
             row = _nearest_valid_series(ds, variables, req.latitude, req.longitude, surface=surface)
             processing_seconds = time.monotonic() - t_process
-            return row, window, provider_seconds, processing_seconds
+            return row, window, provider_seconds, processing_seconds, qlat, qlon
         except Exception as exc:
             errors.append(f"{window:.2f}:{type(exc).__name__}")
         finally:
@@ -233,11 +246,13 @@ def health():
     return {
         "ok": True,
         "service": "pescapro-worker",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "uptime_seconds": int(time.time() - STARTED_AT),
         "max_rss_mb": _rss_mb(),
         "heavy_query_concurrency": 1,
         "adaptive_windows_degrees": list(ADAPTIVE_WINDOWS),
+        "model_grid_degrees": round(MODEL_GRID_DEGREES, 6),
+        "single_cell_first": True,
         "physics_surface_selection": "nearest available surface layer",
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "cache_entries": len(CACHE),
@@ -262,7 +277,7 @@ def _compute_marine(req: MarineRequest, authorization: str | None):
 
     try:
         if req.kind == "waves":
-            row, query_window, provider_seconds, processing_seconds = _fetch_adaptive(req, start, end, username, password)
+            row, query_window, provider_seconds, processing_seconds, query_latitude, query_longitude = _fetch_adaptive(req, start, end, username, password)
             hourly = {
                 "time": row["time"],
                 "wave_height": row["VHM0"],
@@ -303,7 +318,7 @@ def _compute_marine(req: MarineRequest, authorization: str | None):
             "ok": True,
             "mode": req.kind,
             "source": "Copernicus Marine Service",
-            "worker_version": "0.4.0",
+            "worker_version": "0.5.0",
             "dataset": dataset,
             "latitude": req.latitude,
             "longitude": req.longitude,
@@ -312,6 +327,9 @@ def _compute_marine(req: MarineRequest, authorization: str | None):
             "current": current,
             "hourly": hourly,
             "query_window_degrees": query_window,
+            "query_latitude": query_latitude,
+            "query_longitude": query_longitude,
+            "single_cell_attempt": query_window == ADAPTIVE_WINDOWS[0],
             "timing": {
                 "provider_seconds": round(provider_seconds, 2),
                 "processing_seconds": round(processing_seconds, 3),
