@@ -1,4 +1,4 @@
-import os, hmac, math, time, resource
+import os, hmac, math, time, resource, threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Literal
@@ -8,11 +8,20 @@ import copernicusmarine
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="PescaPro Marine Worker", version="0.2.0")
+app = FastAPI(title="PescaPro Marine Worker", version="0.3.0")
 STARTED_AT = time.time()
 
 WAVE_DATASET = "cmems_mod_glo_wav_anfc_0.083deg_PT3H-i"
 PHY_DATASET = "cmems_mod_glo_phy_anfc_0.083deg_PT1H-m"
+
+# Free-instance protection: only one heavy Copernicus query runs at a time.
+HEAVY_QUERY_SLOTS = threading.Semaphore(1)
+STATE_LOCK = threading.Lock()
+INFLIGHT = {}
+CACHE = {}
+CACHE_TTL_SECONDS = 15 * 60
+CACHE_MAX_ENTRIES = 64
+ZONE_STEP = 0.05
 
 class MarineRequest(BaseModel):
     latitude: float = Field(ge=-90, le=90)
@@ -184,17 +193,20 @@ def health():
     return {
         "ok": True,
         "service": "pescapro-worker",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "uptime_seconds": int(time.time() - STARTED_AT),
         "max_rss_mb": _rss_mb(),
+        "heavy_query_concurrency": 1,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "cache_entries": len(CACHE),
+        "inflight": len(INFLIGHT),
         "copernicus_credentials_configured": bool(
             (os.getenv("COPERNICUSMARINE_SERVICE_USERNAME") or "").strip()
             and (os.getenv("COPERNICUSMARINE_SERVICE_PASSWORD") or "").strip()
         ),
     }
 
-@app.post("/marine")
-def marine(req: MarineRequest, authorization: str | None = Header(default=None)):
+def _compute_marine(req: MarineRequest, authorization: str | None):
     _require_worker_key(authorization)
     if not _allowed_pescapro_area(req.latitude, req.longitude):
         raise HTTPException(status_code=422, detail="Coordinates outside PescaPro area")
@@ -251,7 +263,7 @@ def marine(req: MarineRequest, authorization: str | None = Header(default=None))
             "ok": True,
             "mode": req.kind,
             "source": "Copernicus Marine Service",
-            "worker_version": "0.2.0",
+            "worker_version": "0.3.0",
             "dataset": dataset,
             "latitude": req.latitude,
             "longitude": req.longitude,
@@ -271,3 +283,85 @@ def marine(req: MarineRequest, authorization: str | None = Header(default=None))
         # Do not expose credentials or provider internals to the caller.
         print("Copernicus worker error:", type(exc).__name__, str(exc)[:300])
         raise HTTPException(status_code=502, detail="Copernicus Marine unavailable")
+
+
+def _zone_key(req: MarineRequest):
+    zlat = round(req.latitude / ZONE_STEP) * ZONE_STEP
+    zlon = round(req.longitude / ZONE_STEP) * ZONE_STEP
+    return (round(zlat, 4), round(zlon, 4), req.days, req.kind)
+
+def _cache_get(key):
+    now = time.monotonic()
+    with STATE_LOCK:
+        item = CACHE.get(key)
+        if not item:
+            return None
+        if now - item["stored_at"] > CACHE_TTL_SECONDS:
+            CACHE.pop(key, None)
+            return None
+        return item
+
+def _cache_put(key, value):
+    with STATE_LOCK:
+        now = time.monotonic()
+        expired = [k for k, v in CACHE.items() if now - v["stored_at"] > CACHE_TTL_SECONDS]
+        for k in expired:
+            CACHE.pop(k, None)
+        if len(CACHE) >= CACHE_MAX_ENTRIES:
+            oldest = min(CACHE, key=lambda k: CACHE[k]["stored_at"])
+            CACHE.pop(oldest, None)
+        CACHE[key] = {"stored_at": now, "value": value}
+
+def _with_cache_meta(value, status, key, waited=False):
+    out = dict(value)
+    out["cache"] = {
+        "status": status,
+        "zone_latitude": key[0],
+        "zone_longitude": key[1],
+        "ttl_seconds": CACHE_TTL_SECONDS,
+        "waited_for_inflight": waited,
+    }
+    return out
+
+@app.post("/marine")
+def marine(req: MarineRequest, authorization: str | None = Header(default=None)):
+    _require_worker_key(authorization)
+    if not _allowed_pescapro_area(req.latitude, req.longitude):
+        raise HTTPException(status_code=422, detail="Coordinates outside PescaPro area")
+
+    key = _zone_key(req)
+    cached = _cache_get(key)
+    if cached:
+        return _with_cache_meta(cached["value"], "hit", key)
+
+    # Single-flight: one leader computes a given zone/kind/horizon; followers wait
+    # for that result instead of launching duplicate Copernicus downloads.
+    while True:
+        with STATE_LOCK:
+            event = INFLIGHT.get(key)
+            if event is None:
+                event = threading.Event()
+                INFLIGHT[key] = event
+                leader = True
+            else:
+                leader = False
+
+        if leader:
+            try:
+                # Different keys are also serialized to protect the 512 MB instance.
+                with HEAVY_QUERY_SLOTS:
+                    result = _compute_marine(req, authorization)
+                _cache_put(key, result)
+                return _with_cache_meta(result, "miss", key)
+            finally:
+                with STATE_LOCK:
+                    done = INFLIGHT.pop(key, None)
+                    if done:
+                        done.set()
+
+        if not event.wait(timeout=90):
+            raise HTTPException(status_code=503, detail="Marine worker queue timeout")
+        cached = _cache_get(key)
+        if cached:
+            return _with_cache_meta(cached["value"], "hit", key, waited=True)
+        # The leader may have failed. Loop and allow one waiter to retry.
