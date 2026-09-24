@@ -23,8 +23,7 @@ CACHE_TTL_SECONDS = 15 * 60
 CACHE_MAX_ENTRIES = 64
 ZONE_STEP = 0.05
 ADAPTIVE_WINDOWS = (0.03, 0.06, 0.10)
-PHYSICS_SURFACE_DEPTH_M = 0.494
-PHYSICS_SURFACE_DEPTH_TOLERANCE_M = 0.01
+PHYSICS_SURFACE_DEPTH_M = None
 
 class MarineRequest(BaseModel):
     latitude: float = Field(ge=-90, le=90)
@@ -189,9 +188,6 @@ def _open_physics(lat, lon, start, end, username, password, window):
         maximum_longitude=lon + window,
         minimum_latitude=lat - window,
         maximum_latitude=lat + window,
-        # Request only the model's surface layer (~0.494 m), rather than 0-1 m.
-        minimum_depth=PHYSICS_SURFACE_DEPTH_M - PHYSICS_SURFACE_DEPTH_TOLERANCE_M,
-        maximum_depth=PHYSICS_SURFACE_DEPTH_M + PHYSICS_SURFACE_DEPTH_TOLERANCE_M,
         start_datetime=start,
         end_datetime=end,
         coordinates_selection_method="outside",
@@ -242,8 +238,7 @@ def health():
         "max_rss_mb": _rss_mb(),
         "heavy_query_concurrency": 1,
         "adaptive_windows_degrees": list(ADAPTIVE_WINDOWS),
-        "physics_surface_depth_m": PHYSICS_SURFACE_DEPTH_M,
-        "physics_surface_depth_tolerance_m": PHYSICS_SURFACE_DEPTH_TOLERANCE_M,
+        "physics_surface_selection": "nearest available surface layer",
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "cache_entries": len(CACHE),
         "inflight": len(INFLIGHT),
