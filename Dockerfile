@@ -6,4 +6,4 @@ RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -r re
 COPY --chown=1000:1000 main.py README.md ./
 USER 1000:1000
 EXPOSE 8080
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
+CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
